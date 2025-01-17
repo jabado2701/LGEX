@@ -1,0 +1,135 @@
+name: Overall_test Workflow
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  testing:
+    runs-on: ubuntu-latest
+
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      # Step 1: Clone the repository code
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # Step 2: Create AWS credentials file for LocalStack
+      - name: Set AWS Credentials for LocalStack
+        run: |
+          mkdir -p ~/.aws
+          echo "[default]" > ~/.aws/credentials
+          echo "aws_access_key_id = test" >> ~/.aws/credentials
+          echo "aws_secret_access_key = test" >> ~/.aws/credentials
+          echo "aws_session_token = test" >> ~/.aws/credentials
+          echo "[default]" > ~/.aws/config
+          echo "region = us-east-1" >> ~/.aws/config
+
+      # Step 3: Start LocalStack with configurations for S3, Lambda, IAM, and SQS
+      - name: Start LocalStack
+        run: |
+          docker run -d --name localstack \
+            -p 4566:4566 -p 4571:4571 \
+            -e SERVICES="s3,lambda,iam,sqs" \
+            -e LAMBDA_EXECUTOR=docker \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            localstack/localstack
+
+      # Step 4: Wait 10 seconds for LocalStack to be ready
+      - name: Wait for LocalStack
+        run: sleep 10
+
+      # Step 5: Install Terraform
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_wrapper: false
+
+      # Step 6: Install terraform-local and Python dependencies
+      - name: Install Python and Terraform Dependencies
+        run: |
+          pip install terraform-local
+          pip install beautifulsoup4 boto3 flask networkx
+
+      # Step 7: Initialize Terraform with tflocal
+      - name: Initialize Terraform
+        run: tflocal -chdir=terraform init
+
+      # Step 8: Validate Terraform with tflocal
+      - name: Validate Terraform
+        run: tflocal -chdir=terraform validate
+
+      # Step 9: Create Terraform plan with tflocal
+      - name: Plan Terraform
+        run: tflocal -chdir=terraform plan
+
+      # Step 10: Apply Terraform with tflocal
+      - name: Apply Terraform
+        run: tflocal -chdir=terraform apply -auto-approve
+
+      # Step 11: Verify that the S3 buckets have been created
+      - name: Verify S3 Buckets Creation
+        run: |
+          aws --endpoint-url=http://localhost:4566 s3 ls || exit 1
+          aws --endpoint-url=http://localhost:4566 s3 ls s3://lgex-app-bucket || exit 1
+          aws --endpoint-url=http://localhost:4566 s3 ls s3://lgex-download-bucket || exit 1
+
+      # Step 12: Verify the SQS queue creation
+      - name: Verify SQS Queue
+        run: |
+          aws --endpoint-url=http://localhost:4566 sqs list-queues | grep lgex-queue || exit 1
+
+      # Step 13: Verify Lambda function
+      - name: Verify Lambda Function
+        run: |
+          aws --endpoint-url=http://localhost:4566 --region us-east-1 lambda list-functions | grep lgex-batch-processor || exit 1
+
+      # Step 14: Debug PYTHONPATH (optional)
+      - name: Print PYTHONPATH
+        run: |
+          echo "PYTHONPATH=$PYTHONPATH"
+
+      # Step 15: Run the main_crawler.py script
+      - name: Run main_crawler.py with timeout
+        run: |
+          timeout 10s python3 crawler_module/main_crawler.py || true
+
+      # Step 16: Verify that there are books in the S3 bucket
+      - name: Verify Books in S3 lgex-download-bucket
+        run: |
+          aws --endpoint-url=http://localhost:4566 s3 ls s3://lgex-download-bucket || exit 1
+
+      # Step 17: Verify that there is a graph in the S3 bucket
+      - name: Verify Graph in S3 lgex-app-bucket
+        run: |
+          aws --endpoint-url=http://localhost:4566 s3 ls s3://lgex-app-bucket || exit 1
+
+      # Step 18: Verify SQS -> Lambda Event Source Mapping
+      - name: Verify SQS -> Lambda Event Source Mapping
+        run: |
+          aws --endpoint-url=http://localhost:4566 sqs get-queue-attributes --queue-url http://localhost:4566/000000000000/lgex-queue || exit 1
+
+      # Step 19: Run and Test the API
+      - name: Run main_api.py
+        run: |
+          # Start the API in the background
+          python3 api_module/main_api.py &
+          API_PID=$!  # Capture the PID of the API process
+          sleep 5  # Wait for the API to be ready
+          # Perform API queries
+          echo "Testing API..."
+          curl -s "http://127.0.0.1:8080/search/dijkstra/?start=start&goal=end" > result1.json
+          sleep 10
+          curl -s "http://127.0.0.1:8080/search/dijkstra/?start=end&goal=start" > result2.json
+          echo "Result 1:"
+          cat result1.json
+          echo "Result 2:"
+          cat result2.json
+          # Stop the API
+          kill $API_PID
